@@ -1,114 +1,97 @@
 #!/usr/bin/env python3
 """
-test2 快速演示脚本（纯 Python 版）
-用法:  python3 start_demo.py
-
-等同于 deploy.sh，但更可控（日志可见）。
+test2 快速演示脚本 — 生成数据 → 启动 Coordinator → 启动 5 个 Worker → 查询演示
 """
-import logging
-import os
-import subprocess
-import sys
-import time
+import os, subprocess, sys, time, json, signal
 
 DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(DIR, "workers")
-os.makedirs(DATA_DIR, exist_ok=True)
+WORKERS_DIR = os.path.join(DIR, "workers")
+os.makedirs(WORKERS_DIR, exist_ok=True)
 
-NUM_WORKERS = 5
 NUM_NODES = 50
-EDGE_DENSITY = 0.08
-COORD_PORT = 9999
-BASE_PORT = 9100
+DENSITY = 0.08
+SEED = 42
+NUM_WORKERS = 5
+COORD_PORT = 9000
 
 procs = []
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s %(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-
-print("=" * 60)
-print(" Distributed Graph Query System — Demo")
-print("=" * 60)
-
 
 def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    print(f"[demo] {msg}", flush=True)
 
+def cleanup():
+    log("清理进程...")
+    for p in procs:
+        try: p.terminate()
+        except: pass
+    for p in procs:
+        try: p.wait(timeout=3)
+        except: pass
 
-def run_py(args, capture=False):
-    """运行 python3 脚本"""
-    cmd = [sys.executable] + args
-    if capture:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        return r.stdout, r.stderr
-    else:
-        return subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, bufsize=1
-        )
+signal.signal(signal.SIGINT, lambda *a: (cleanup(), sys.exit(0)))
+signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(0)))
 
+gen_data = os.path.join(DIR, "gen_all.py")
+log("使用 gen_all.py 生成图数据...")
+subprocess.run([sys.executable, gen_data, str(NUM_NODES), str(DENSITY), str(SEED),
+                "--num-parts", str(NUM_WORKERS), "--out-dir", WORKERS_DIR],
+               check=True, capture_output=True)
 
-log(f"Step 1/5: 生成 {NUM_WORKERS} 个分区数据文件...")
-for i in range(NUM_WORKERS):
-    data_file = os.path.join(DATA_DIR, f"part_{i}.json")
-    run_py([
-        os.path.join(DIR, "worker.py"),
-        "--generate", str(NUM_NODES), str(EDGE_DENSITY), "42", data_file,
-        "--worker-id", f"node_{i}",
-    ], capture=True)
-log("  ✓ 数据文件就绪")
-
-log(f"Step 2/5: 启动 Coordinator (:{COORD_PORT})...")
-c = run_py([os.path.join(DIR, "coordinator.py"), "--port", str(COORD_PORT)])
-procs.append(c)
+# 2. 启动 Coordinator
+log("启动 Coordinator...")
+p = subprocess.Popen([
+    sys.executable, os.path.join(DIR, "coordinator.py"),
+    "--port", str(COORD_PORT),
+], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+procs.append(p)
 time.sleep(1)
-log(f"  ✓ Coordinator PID={c.pid}")
 
-log(f"Step 3/5: 启动 {NUM_WORKERS} 个 Worker...")
+# 3. 启动 Worker
+log("启动 Workers...")
 for i in range(NUM_WORKERS):
-    port = BASE_PORT + i
-    data_file = os.path.join(DATA_DIR, f"part_{i}.json")
-    w = run_py([
-        os.path.join(DIR, "worker.py"),
+    port = 9100 + i
+    data_file = os.path.join(WORKERS_DIR, f"part_{i}.json")
+    p = subprocess.Popen([
+        sys.executable, os.path.join(DIR, "worker.py"),
         "--worker-id", f"node_{i}",
+        "--host", "127.0.0.1",
         "--port", str(port),
         "--coord-host", "127.0.0.1",
         "--coord-port", str(COORD_PORT),
         "--data-file", data_file,
-    ])
-    procs.append(w)
-    log(f"  ✓ Worker node_{i} @ :{port} (PID={w.pid})")
-    time.sleep(0.3)
+        "--num-parts", str(NUM_WORKERS),
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    procs.append(p)
 
-log("Step 4/5: 等待系统就绪...")
-time.sleep(3)
-log("  ✓ 系统就绪\n")
+log("等待 Worker 注册...")
+time.sleep(2)
 
-log("Step 5/5: 运行演示查询...\n")
+# 4. 执行查询
+def q(args):
+    r = subprocess.run([
+        sys.executable, os.path.join(DIR, "client.py"),
+        "--coord-host", "127.0.0.1",
+        "--coord-port", str(COORD_PORT),
+    ] + args, capture_output=True, text=True)
+    return r.stdout + r.stderr
 
-client = os.path.join(DIR, "client.py")
-coord_args = ["--coord-host", "127.0.0.1", "--coord-port", str(COORD_PORT)]
+log("=== 测试 1: 邻居查询 (节点 5) ===")
+print(q(["neighbor", "5"]))
 
-queries = [
-    ("neighbor 5", ["neighbor", "5"]),
-    ("common 10 20", ["common", "10", "20"]),
-    ("triangle 5", ["triangle", "5"]),
-    ("triangle (全图)", ["triangle"]),
-]
+log("=== 测试 2: 邻居查询 (节点 42) ===")
+print(q(["neighbor", "42"]))
 
-for label, args in queries:
-    log(f"── {label} ──")
-    out, err = run_py([client] + coord_args + args, capture=True)
-    if out:
-        print(out)
-    if err:
-        print(err)
-    print()
+log("=== 测试 3: 共同邻居 (跨分区) ===")
+print(q(["common", "5", "18"]))
 
-log("演示完成，关闭所有进程...")
-for p in list(procs):
-    p.terminate()
-    p.wait(timeout=5)
-log("所有进程已关闭")
+log("=== 测试 4: 单节点三角 (节点 5) ===")
+print(q(["triangle", "5"]))
+
+log("=== 测试 5: 全图三角计数 (分布式) ===")
+print(q(["triangle"]))
+
+log("=== 测试 6: shutdown ===")
+print(q(["shutdown"]))
+
+cleanup()
+log("完成")

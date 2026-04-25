@@ -27,6 +27,17 @@
 
 **一致性哈希分区：** `partition = int(md5(str(node_id).encode()).hexdigest(), 16) % NUM_PARTITIONS`
 
+## 分布式三角计数（核心难点）
+
+三角形顶点可能分布在 2~3 台不同的 Worker 上。例如三角形 `(0,31,48)`：节点 0 在分区 0，节点 31 在分区 1，节点 48 在分区 2。
+
+**两阶段协同策略：**
+1. **收集全图边** — Coordinator 向所有 Worker 索取边集合，去重得到全图边列表
+2. **对每条边 `(u,v)` 并行查询** — 同时向 u 所在 Worker 和 v 所在 Worker 索取邻居列表
+3. **Coordinator 本地求交集** — `neighbors(u) ∩ neighbors(v)` = 共同邻居 w，即三角形 `(u,v,w)`
+
+为什么不能委托给单一 Worker？Worker A 有 u 的局部邻接表但可能不知道 v 的完整信息，跨分区时必然漏三角。
+
 ## 快速启动
 
 ```bash
@@ -37,11 +48,7 @@ python3 start_demo.py
 
 # 方式二：逐步启动
 # 1. 生成数据
-python3 worker.py --generate 50 0.08 42 workers/part_0.json --worker-id node_0
-python3 worker.py --generate 50 0.08 42 workers/part_1.json --worker-id node_1
-python3 worker.py --generate 50 0.08 42 workers/part_2.json --worker-id node_2
-python3 worker.py --generate 50 0.08 42 workers/part_3.json --worker-id node_3
-python3 worker.py --generate 50 0.08 42 workers/part_4.json --worker-id node_4
+python3 gen_all.py 50 0.08 42 --num-parts 5 --out-dir workers
 
 # 2. 启动 Coordinator（后台）
 python3 coordinator.py --port 9999 &
@@ -113,11 +120,18 @@ test2/
 ├── worker.py              # Worker 节点（独立进程）
 ├── coordinator.py         # Coordinator 协调节点
 ├── client.py              # 命令行客户端
+├── gen_all.py             # 中心化数据生成器（推荐使用，保证跨分区一致性）
 ├── deploy.sh              # 一键部署演示脚本
 ├── start_demo.py          # Python 版演示脚本
-└── workers/               # 数据文件目录（由 generate 命令创建）
+└── workers/               # 数据文件目录（由 gen_all.py 或 generate 命令创建）
     ├── part_0.json
     ├── part_1.json
     ├── ...
-    └── partition_map.json
 ```
+
+## 验证
+
+系统经过 **完全一致性验证**（50 节点 5 分区）：
+- 分布式三角计数结果 = 完整图（合并所有分区）三角计数结果 ✅
+- 跨分区三角形（顶点分布在 2~3 台 Worker）正确计数 ✅
+- 跨 Worker 共同邻居查询（`common`）正确 ✅

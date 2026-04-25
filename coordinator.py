@@ -2,92 +2,62 @@
 """
 分布式图查询系统 — Coordinator 协调节点
 
-Coordinator 负责：
-  1. 接受 Worker 注册
-  2. 维护 Worker 注册表 (worker_id → {host, port, ...})
-  3. 接收 Client 查询请求 → 转发到目标 Worker → 返回结果
-  4. 分布式三角查询：收集全图边 → 按边分发到对应 Worker → 汇总结果
+核心设计：
+  1. Worker 注册管理 — 维护 worker_id → {host, port, partition}
+  2. 一致性哈希路由 — 节点查询按 MD5 取模路由到目标 Worker
+  3. 分布式三角计数（关键）—
+     两阶段策略保证跨分区三角形不丢失：
+       a) 收集全图所有边
+       b) 对每条边 (u,v)，并行向 u 和 v 所在 Worker 索取邻居列表
+       c) Coordinator 本地求交集 → 共同邻居 w → 三角形 (u,v,w)
 
-启动方式：
-  python3 coordinator.py --port 9000
+  为什么不用 check_triangle(u,v) 委托给单一 Worker？
+    三角顶点可能分布在 2~3 台不同的 Worker 上。
+    Worker A 有 u 的邻接表但可能没有 v 的完整信息，
+    Worker B 有 v 的邻接表但不知道 u 连了谁。
+    只有 Coordinator 拿到两端邻居列表后求交集，才能覆盖跨分区三角形。
 """
-
-import argparse
-import logging
-import os
-import socket
-import sys
-import threading
-import time
-import uuid
-
+import argparse, logging, os, socket, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from protocol import (
-    get_partition,
-    make_msg,
-    pack_msg,
-    recv_msg,
-    MSG_REGISTER,
-    MSG_REGISTER_ACK,
-    MSG_HEARTBEAT,
-    MSG_HEARTBEAT_ACK,
-    MSG_QUERY_NEIGHBOR,
-    MSG_QUERY_COMMON,
-    MSG_QUERY_TRIANGLE,
-    MSG_QUERY_EDGES,
-    MSG_QUERY_CHECK_TRI,
-    MSG_RESULT_OK,
-    MSG_RESULT_ERR,
-    MSG_SHUTDOWN,
-    logger,
+    get_partition, make_msg, pack_msg, recv_msg,
+    MSG_REGISTER, MSG_REGISTER_ACK, MSG_HEARTBEAT, MSG_HEARTBEAT_ACK,
+    MSG_QUERY_NEIGHBOR, MSG_QUERY_COMMON, MSG_QUERY_TRIANGLE,
+    MSG_QUERY_EDGES, MSG_QUERY_NLIST,
+    MSG_RESULT_OK, MSG_RESULT_ERR, MSG_SHUTDOWN, logger,
 )
-
 logger = logging.getLogger("Coordinator")
 
-
 class CoordServer:
-    """协调节点"""
-
     def __init__(self, host="0.0.0.0", port=9000):
-        self.host = host
-        self.port = port
+        self.host, self.port = host, port
         self.running = False
-
-        # Worker 注册表：worker_id → {host, port, directed, connected_sock, ...}
-        self.workers = {}
-        self._workers_lock = threading.Lock()
-
-        # 已知 Worker 列表（用于分发边进行三角计算时知道要找谁）
-        self.num_partitions = 5  # 默认分区数
-
+        self.workers = {}         # wid → {host, port, partition}
+        self.num_parts = 5
+        self._lock = threading.Lock()
         self._server = None
 
     def start(self):
-        """启动 TCP 服务端"""
         self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server.bind((self.host, self.port))
         self._server.listen(64)
         self.running = True
-        logger.info(f"Coordinator 启动 @ {self.host}:{self.port}")
-
+        logger.info(f"Coordinator @ {self.host}:{self.port}")
         while self.running:
             try:
                 conn, addr = self._server.accept()
-                threading.Thread(
-                    target=self._handle_conn, args=(conn, addr), daemon=True
-                ).start()
-            except OSError:
+                threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
+            except:
                 break
 
-    def _rpc_to_worker(self, worker_id, msg) -> dict:
-        """向指定 Worker 发送 RPC 请求，返回应答"""
-        with self._workers_lock:
-            info = self.workers.get(worker_id)
+    # ── RPC 原语 ──
+    def _rpc(self, wid, msg):
+        with self._lock:
+            info = self.workers.get(wid)
             if not info:
-                return {"error": f"Worker {worker_id} 未注册"}
+                return {"error": f"{wid} 未注册"}
             host, port = info["host"], info["port"]
-
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(30)
@@ -97,256 +67,227 @@ class CoordServer:
             sock.close()
             return resp or {"error": "无响应"}
         except Exception as e:
-            return {"error": f"连接到 Worker {worker_id} 失败: {e}"}
+            return {"error": f"→ {wid} 失败: {e}"}
 
-    def _rpc_all_workers(self, msg_fn, skip=None):
-        """向所有 Worker 并发发送 RPC"""
-        with self._workers_lock:
-            worker_ids = list(self.workers.keys())
-        results = []
-        threads = []
-        lock = threading.Lock()
+    def _extract_payload(self, resp):
+        """从 RPC 应答中提取 payload dict（兼容多种返回格式）"""
+        if isinstance(resp, dict) and "error" in resp:
+            return resp
+        if isinstance(resp, dict) and "payload" in resp:
+            return resp["payload"]
+        return resp
 
-        def do_rpc(wid):
-            msg = msg_fn(wid)
-            resp = self._rpc_to_worker(wid, msg)
-            with lock:
-                results.append((wid, resp))
+    def _locate(self, nid):
+        """找到节点 nid 所在的 Worker"""
+        part = get_partition(nid, self.num_parts)
+        target = f"node_{part}"
+        with self._lock:
+            if target in self.workers:
+                return target
+            # 兼容：遍历找同分区
+            for wid, info in self.workers.items():
+                if info.get("partition") == part:
+                    return wid
+        return {"error": f"节点 {nid} (分区 {part}) 无 Worker"}
 
-        for wid in worker_ids:
-            if wid == skip:
-                continue
-            t = threading.Thread(target=do_rpc, args=(wid,), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join(timeout=60)
-        return results
-
-    def _handle_conn(self, conn, addr):
-        """处理单个 TCP 连接"""
+    # ── 消息处理 ──
+    def _handle(self, conn, addr):
         try:
             msg = recv_msg(conn)
-            if msg is None:
-                return
-            resp = self._process(msg)
-            if resp:
-                conn.sendall(pack_msg(resp))
+            if msg: conn.sendall(pack_msg(self._process(msg)))
         except Exception as e:
-            logger.error(f"处理请求异常: {e}")
+            logger.error(f"处理异常: {e}")
         finally:
             conn.close()
 
     def _process(self, msg):
-        """消息路由"""
-        sender = msg.get("sender", "unknown")
-        payload = msg.get("payload", {})
-        mt = msg["msg_type"]
+        mt, payload = msg["msg_type"], msg.get("payload", {})
 
         if mt == MSG_REGISTER:
             return self._on_register(msg)
 
-        elif mt == MSG_HEARTBEAT:
-            return make_msg(MSG_HEARTBEAT_ACK, "coordinator", {"status": "ok"})
-
         elif mt == MSG_QUERY_NEIGHBOR:
             nid = payload["node_id"]
-            target = self._locate_node(nid)
-            if "error" in target:
-                return make_msg(MSG_RESULT_ERR, "coordinator", target)
-            resp = self._rpc_to_worker(target, msg)
-            if "error" in resp:
-                return make_msg(MSG_RESULT_ERR, "coordinator", {"error": resp["error"]})
-            return make_msg(MSG_RESULT_OK, "coordinator", resp.get("payload", resp))
+            target = self._locate(nid)
+            if isinstance(target, dict): return make_msg(MSG_RESULT_ERR, "coord", target)
+            resp = self._rpc(target, msg)
+            return make_msg(MSG_RESULT_OK, "coord", self._extract_payload(resp))
 
         elif mt == MSG_QUERY_COMMON:
             a, b = payload["node_a"], payload["node_b"]
-            # 两个节点可能在同一 Worker 或不同 Worker
-            wa = self._locate_node(a)
-            wb = self._locate_node(b)
-            if "error" in wa or "error" in wb:
-                return make_msg(MSG_RESULT_ERR, "coordinator",
-                                {"error": wa.get("error") or wb.get("error")})
-
+            wa, wb = self._locate(a), self._locate(b)
+            if isinstance(wa, dict) or isinstance(wb, dict):
+                return make_msg(MSG_RESULT_ERR, "coord",
+                                {"error": wa.get("error", wb.get("error", ""))})
             if wa == wb:
-                # 同一 Worker：直接转发
-                resp = self._rpc_to_worker(wa, msg)
-                if "error" in resp:
-                    return make_msg(MSG_RESULT_ERR, "coordinator", {"error": resp["error"]})
-                return make_msg(MSG_RESULT_OK, "coordinator", resp.get("payload", resp))
+                resp = self._rpc(wa, msg)
+                return make_msg(MSG_RESULT_OK, "coord", self._extract_payload(resp))
             else:
-                # 不同 Worker：各自查邻居，Coordinator 本地求交集
-                msg_a = make_msg(MSG_QUERY_NEIGHBOR, "coordinator", {"node_id": a})
-                msg_b = make_msg(MSG_QUERY_NEIGHBOR, "coordinator", {"node_id": b})
-                ra = self._rpc_to_worker(wa, msg_a)
-                rb = self._rpc_to_worker(wb, msg_b)
+                # 跨 Worker：各自查邻居列表 → 本地求交集
+                ra = self._extract_payload(self._rpc(wa, make_msg(MSG_QUERY_NLIST, "coord", {"node_id": a})))
+                rb = self._extract_payload(self._rpc(wb, make_msg(MSG_QUERY_NLIST, "coord", {"node_id": b})))
                 if "error" in ra or "error" in rb:
-                    return make_msg(MSG_RESULT_ERR, "coordinator",
+                    return make_msg(MSG_RESULT_ERR, "coord",
                                     {"error": ra.get("error", "") + rb.get("error", "")})
-                na = set(ra.get("payload", ra).get("neighbors", []))
-                nb = set(rb.get("payload", rb).get("neighbors", []))
+                na = set(ra.get("neighbors", []))
+                nb = set(rb.get("neighbors", []))
                 common = sorted(na & nb)
-                return make_msg(MSG_RESULT_OK, "coordinator", {
-                    "node_a": a, "node_b": b,
-                    "common_neighbors": common, "count": len(common),
+                return make_msg(MSG_RESULT_OK, "coord", {
+                    "node_a": a, "node_b": b, "common_neighbors": common, "count": len(common),
                 })
 
         elif mt == MSG_QUERY_TRIANGLE:
             nid = payload.get("node_id")
             if nid is not None:
-                # 单节点三角 — 查找该节点
-                target = self._locate_node(nid)
-                if "error" in target:
-                    return make_msg(MSG_RESULT_ERR, "coordinator", target)
-                resp = self._rpc_to_worker(target, msg)
-                if "error" in resp:
-                    return make_msg(MSG_RESULT_ERR, "coordinator", {"error": resp["error"]})
-                return make_msg(MSG_RESULT_OK, "coordinator", resp.get("payload", resp))
+                return self._triangle_single(nid)
             else:
-                # 全图三角 — 分布式协同计算
-                return self._distributed_triangle_count(msg)
+                return self._triangle_distributed()
 
         elif mt == MSG_QUERY_EDGES:
-            # 收集全图边
+            # 收集全图边（转发给所有 Worker）
             return self._collect_all_edges()
 
         elif mt == MSG_SHUTDOWN:
-            logger.info("收到关闭指令")
             self.running = False
-            return make_msg(MSG_RESULT_OK, "coordinator", {"status": "shutting_down"})
+            return make_msg(MSG_RESULT_OK, "coord", {"status": "shutdown"})
 
-        else:
-            return make_msg(MSG_RESULT_ERR, "coordinator", {
-                "error": f"未知消息类型: {mt}"
-            })
+        return make_msg(MSG_RESULT_ERR, "coord", {"error": f"未知类型 {mt}"})
 
-    def _locate_node(self, node_id):
-        """根据节点 ID 找到所在 Worker"""
-        with self._workers_lock:
-            if not self.workers:
-                return {"error": "没有注册的 Worker"}
-
-            partition = get_partition(node_id, self.num_partitions)
-            worker_id = f"node_{partition}"
-            if worker_id not in self.workers:
-                # 遍历查找
-                for wid, info in self.workers.items():
-                    if info.get("partition") == partition:
-                        return wid
-                return {"error": f"节点 {node_id} (partition={partition}) 无对应 Worker"}
-            return worker_id
-
+    # ── 注册 ──
     def _on_register(self, msg):
-        """处理 Worker 注册"""
         p = msg["payload"]
         wid = p["worker_id"]
-        with self._workers_lock:
+        with self._lock:
             self.workers[wid] = {
-                "host": p["host"],
-                "port": p["port"],
-                "directed": p.get("directed", False),
-                "partition": int(wid.split("_")[-1]) if "_" in wid else 0,
+                "host": p["host"], "port": p["port"],
+                "partition": p.get("partition", 0),
             }
-            wlist = {k: v.copy() for k, v in self.workers.items()}
-            # 减少 serialization
-            wlist_short = {}
-            for k, v in wlist.items():
-                wlist_short[k] = {"host": v["host"], "port": v["port"]}
-            logger.info(f"Worker 注册: {wid} @ {p['host']}:{p['port']} "
-                        f"(共 {len(self.workers)} 个)")
+            if "num_parts" in p:
+                self.num_parts = p["num_parts"]
+            wlist = {k: {"host": v["host"], "port": v["port"]}
+                     for k, v in self.workers.items()}
+        logger.info(f"注册: {wid} @ {p['host']}:{p['port']} ({len(self.workers)} 个在线)")
+        return make_msg(MSG_REGISTER_ACK, "coord", {"status": "ok", "workers": wlist})
 
-        return make_msg(MSG_REGISTER_ACK, "coordinator", {
-            "status": "ok",
-            "workers": wlist_short,
+    # ── 单节点三角 ──
+    def _triangle_single(self, nid):
+        """
+        单节点三角：这个节点 nid 参与的所有三角形。
+        跨分区时：nid 在 Worker A 上，但 nid 的邻居可能分散在不同 Worker 上。
+        策略：先问 nid 的邻居列表，然后对每个邻居 u，问 nid 和 u 的共同邻居。
+        如果 u 在另一台 Worker 上，共同邻居查询会自动跨 Worker 处理。
+        """
+        target = self._locate(nid)
+        if isinstance(target, dict):
+            return make_msg(MSG_RESULT_ERR, "coord", target)
+
+        # 先拿 nid 的邻居列表
+        resp = self._rpc(target, make_msg(MSG_QUERY_NLIST, "coord", {"node_id": nid}))
+        payload = self._extract_payload(resp)
+        if "error" in payload:
+            return make_msg(MSG_RESULT_ERR, "coord", payload)
+        nbrs = payload.get("neighbors", [])
+
+        # 对每个邻居 u，查 nid 和 u 的共同邻居
+        tris = set()
+        for u in nbrs:
+            cresp = self._process(make_msg(MSG_QUERY_COMMON, "coord", {"node_a": nid, "node_b": u}))
+            cp = cresp.get("payload", {})
+            for w in cp.get("common_neighbors", []):
+                tris.add(tuple(sorted((nid, u, w))))
+
+        sorted_tris = sorted(tris)
+        return make_msg(MSG_RESULT_OK, "coord", {
+            "node": nid, "count": len(sorted_tris), "triangles": sorted_tris,
         })
 
+    # ── 全图三角（分布式协同） ──
     def _collect_all_edges(self):
-        """从所有 Worker 收集全图边"""
-        results = self._rpc_all_workers(
-            lambda wid: make_msg(MSG_QUERY_EDGES, "coordinator", {})
-        )
+        """从所有 Worker 收集全图边，以 set 返回"""
+        with self._lock:
+            wids = list(self.workers.keys())
         all_edges = set()
-        for wid, resp in results:
-            if "payload" in resp:
-                edges = resp["payload"].get("edges", [])
-            elif isinstance(resp, dict):
-                edges = resp.get("edges", resp.get("payload", {}).get("edges", []))
-            else:
-                edges = []
-            for e in edges:
-                all_edges.add(tuple(e))
+        lock = threading.Lock()
+        def collect(wid):
+            resp = self._rpc(wid, make_msg(MSG_QUERY_EDGES, "coord", {}))
+            payload = self._extract_payload(resp)
+            if "error" not in payload:
+                with lock:
+                    for e in payload.get("edges", []):
+                        all_edges.add(tuple(e))
+        threads = [threading.Thread(target=collect, args=(w,), daemon=True) for w in wids]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=60)
+        logger.info(f"收集到 {len(all_edges)} 条全图边")
         return sorted(all_edges)
 
-    def _distributed_triangle_count(self, original_msg):
+    def _triangle_distributed(self):
         """
-        分布式全图三角计数：收集全图边 → Coordinator 汇总 → 对每条边
-        发送到 (src 所在 Worker 或 dst 所在 Worker)，让 Worker 检查
-        两个端点是否有共同邻居 → 汇总去重
+        分布式全图三角计数 — 两阶段策略：
+
+        阶段 1：收集全图所有边（所有 Worker 的 edges 并集）
+        阶段 2：对每条边 (u,v)，同时向 u 所在 Worker 和 v 所在 Worker
+                索取邻居列表。Coordinator 本地求交集 = 共同邻居。
+                每条公共邻居 w 对应一个三角形 (u,v,w)。
+
+        这是正确的分布式三角计数方案，因为：
+        - u 的完整邻接表只在 u 所在 Worker 上
+        - v 的完整邻接表只在 v 所在 Worker 上
+        - Coordinator 拿到两端列表后本地求交集，不依赖任何单一 Worker 的全局视图
         """
         logger.info("开始分布式全图三角计数")
+        edges = list(self._collect_all_edges())
+        if isinstance(edges and edges[0], dict) and "error" in edges[0]:
+            return make_msg(MSG_RESULT_ERR, "coord", {"error": "收集边失败"})
 
-        # Step 1: 收集全图所有边
-        edges = self._collect_all_edges()
-        logger.info(f"收集到 {len(edges)} 条全图边")
-
-        # Step 2: 对每条边，确定由哪个 Worker 来检测三角
-        # 策略：边 (u,v) 发送给 u 所在 Worker，因为 Worker 存有 u 的完整邻接表
-        triangles_set = set()
+        tris = set()
         lock = threading.Lock()
+        BATCH_SIZE = 100
 
-        def check_edge(u, v):
-            target = self._locate_node(u)
-            if "error" in target:
-                return
-            check_msg = make_msg(MSG_QUERY_CHECK_TRI, "coordinator", {"u": u, "v": v})
-            resp = self._rpc_to_worker(target, check_msg)
-            if "error" in resp:
-                return
-            pts = (resp.get("payload", {}) if isinstance(resp, dict)
-                   else {}).get("triangles", [])
+        def process_batch(batch):
+            local_tris = set()
+            for u, v in batch:
+                # 拿到 u 的邻居列表
+                tu = self._locate(u)
+                tv = self._locate(v)
+                if isinstance(tu, dict) or isinstance(tv, dict):
+                    continue
+                ru = self._extract_payload(
+                    self._rpc(tu, make_msg(MSG_QUERY_NLIST, "coord", {"node_id": u})))
+                rv = self._extract_payload(
+                    self._rpc(tv, make_msg(MSG_QUERY_NLIST, "coord", {"node_id": v})))
+                if "error" in ru or "error" in rv:
+                    continue
+                nu = set(ru.get("neighbors", []))
+                nv = set(rv.get("neighbors", []))
+                for w in nu & nv:
+                    local_tris.add(tuple(sorted((u, v, w))))
             with lock:
-                for tri in pts:
-                    triangles_set.add(tuple(tri))
+                tris.update(local_tris)
 
         threads = []
-        for u, v in edges:
-            t = threading.Thread(target=check_edge, args=(u, v), daemon=True)
-            t.start()
-            threads.append(t)
-            # 控制并发
-            if len(threads) >= 100:
-                for tt in threads:
-                    tt.join(timeout=60)
-                threads = []
-        for t in threads:
-            t.join(timeout=60)
+        for i in range(0, len(edges), BATCH_SIZE):
+            batch = edges[i:i+BATCH_SIZE]
+            t = threading.Thread(target=process_batch, args=(batch,), daemon=True)
+            t.start(); threads.append(t)
+        for t in threads: t.join(timeout=120)
 
-        sorted_tris = sorted(triangles_set)
-        logger.info(f"分布式三角计数完成: {len(sorted_tris)} 个三角形")
-        return make_msg(MSG_RESULT_OK, "coordinator", {
-            "total": len(sorted_tris),
-            "triangles": sorted_tris,
-        })
+        sorted_tris = sorted(tris)
+        logger.info(f"全图三角计数完成: {len(sorted_tris)} 个")
+        return make_msg(MSG_RESULT_OK, "coord", {"total": len(sorted_tris), "triangles": sorted_tris})
 
     def stop(self):
         self.running = False
-        if self._server:
-            self._server.close()
-        logger.info("Coordinator 已关闭")
-
+        if self._server: self._server.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="分布式图查询 Coordinator")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
-    parser.add_argument("--port", type=int, default=9000, help="监听端口")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9000)
     args = parser.parse_args()
-
     cs = CoordServer(host=args.host, port=args.port)
-    try:
-        cs.start()
-    except KeyboardInterrupt:
-        cs.stop()
-
+    try: cs.start()
+    except KeyboardInterrupt: cs.stop()
 
 if __name__ == "__main__":
     main()
