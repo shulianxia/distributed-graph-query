@@ -1,3 +1,6 @@
 __pycache__/
+*.pyc
 workers/*.json
-workers/*.json
+test3/__pycache__/
+test3/workers/*.json
+test3/__pycache__/
