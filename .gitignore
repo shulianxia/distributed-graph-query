@@ -1,3 +1,2 @@
 __pycache__/
-workers/*.json
-workers/*.json
+**/workers/*.json
